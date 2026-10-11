@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#1b1c1f">
+  <meta name="description" content="FilmCraft Pocket: non-linear video editing on Android mobile">
+  <title>FilmCraft Pocket</title>
+  <link rel="icon" href="favicon.png" type="image/png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icon-256.png">
+  <link rel="stylesheet" href="keyboard.css">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1c1f; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+    #loading {
+      position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
+      align-items: center; justify-content: center; color: #c9c9cc;
+      font: 14px/1.4 system-ui, sans-serif; pointer-events: none;
+    }
+    #loading img { width: 56px; height: 56px; }
+    #loading .err { color: #ff8a7a; white-space: pre-wrap; max-width: 70ch; pointer-events: auto; }
+    #fatal {
+      position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+      background: rgba(20, 20, 22, 0.88); color: #e6e6e8; font: 14px/1.45 system-ui, sans-serif; z-index: 10;
+    }
+    #fatal.on { display: flex; }
+    #fatal .box { max-width: min(78ch, calc(100vw - 32px)); padding: 20px 24px; background: #26272b; border-radius: 8px; }
+    #fatal h1 { margin: 0 0 8px; font-size: 17px; color: #ff8a7a; }
+    #fatal pre { max-height: 40vh; overflow: auto; white-space: pre-wrap; font-size: 12px; color: #c9c9cc; }
+    #fatal button { font: inherit; padding: 6px 14px; border: 0; border-radius: 6px; background: #7457c8; color: #fff; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <canvas id="filmcraft_canvas"></canvas>
+  <div id="loading">
+    <img src="favicon.png" alt="">
+    <div id="status">Loading FilmCraft Pocket…</div>
+    <div id="substatus" style="font-size:12px;color:#8a8c99;">Initializing…</div>
+  </div>
+  <div id="fatal" role="alertdialog" aria-labelledby="fatal-title">
+    <div class="box">
+      <h1 id="fatal-title">FilmCraft Pocket stopped working</h1>
+      <div>Unsaved changes are kept in local storage and come back when you reload.</div>
+      <pre id="fatal-msg"></pre>
+      <button id="fatal-reload" type="button">Reload</button>
+    </div>
+  </div>
+
+  <script>
+    window.filmcraftLoad = {};
+    let lastPanic = null;
+    const consoleError = console.error.bind(console);
+    console.error = (...a) => {
+      const m = a.map(String).join(" ");
+      if (/panicked at|memory allocation of/.test(m)) lastPanic = m;
+      consoleError(...a);
+    };
+    window.filmcraftFatal = (what) => {
+      if (window.filmcraftLoad.fatal) return;
+      const msg = lastPanic || String(what && (what.stack || what.message) || what);
+      window.filmcraftLoad.fatal = msg;
+      const el = document.getElementById("fatal");
+      document.getElementById("fatal-msg").textContent = msg.split("\n\nStack:")[0];
+      el.classList.add("on");
+    };
+    document.getElementById("fatal-reload").onclick = () => location.reload();
+    const isFatal = (e) => e instanceof WebAssembly.RuntimeError || /panicked at|unreachable|memory access out of bounds/.test(String(e && e.message || e));
+    addEventListener("error", (ev) => { if (window.filmcraftLoad.readyMs && isFatal(ev.error || ev.message)) window.filmcraftFatal(ev.error || ev.message); });
+    addEventListener("unhandledrejection", (ev) => { if (window.filmcraftLoad.readyMs && isFatal(ev.reason)) window.filmcraftFatal(ev.reason); });
+  </script>
+
+  <script type="module">
+    import init, * as fc from "./filmcraft_web.js";
+    const t0 = performance.now();
+
+    // The agent / test API: the control channel as promises
+    window.filmcraft = {
+      request: (method, params) => fc.request ? fc.request(method, params ?? {}) : Promise.resolve(),
+      execute: (command, params) => fc.request ? fc.request("engine.execute", { command, params: params ?? {} }) : Promise.resolve(),
+      commands: () => fc.request ? fc.request("engine.commands", {}) : Promise.resolve(),
+      info: () => ({
+        ...(fc.info ? fc.info() : {}),
+        crossOriginIsolated: self.crossOriginIsolated,
+        webgpu: !!navigator.gpu,
+        load: window.filmcraftLoad,
+      }),
+    };
+
+    const setStatus = (msg) => {
+      const sub = document.getElementById("substatus");
+      if (sub) sub.textContent = msg;
+      console.log("[LoadStep]", msg);
+      if (window.AndroidBridge && window.AndroidBridge.log) {
+        window.AndroidBridge.log("step", msg);
+      }
+    };
+
+    window.addEventListener("error", (ev) => {
+      console.error("[UncaughtError]", ev.message, ev.filename, ev.lineno, ev.error);
+      if (window.AndroidBridge && window.AndroidBridge.reportError) {
+        window.AndroidBridge.reportError(ev.message || "Uncaught Error", ev.error ? (ev.error.stack || String(ev.error)) : `${ev.filename}:${ev.lineno}`);
+      }
+    });
+
+    window.addEventListener("unhandledrejection", (ev) => {
+      console.error("[UnhandledRejection]", ev.reason);
+      if (window.AndroidBridge && window.AndroidBridge.reportError) {
+        window.AndroidBridge.reportError("Unhandled Rejection", ev.reason ? (ev.reason.stack || String(ev.reason)) : "Promise rejected");
+      }
+    });
+
+    try {
+      setStatus("Loading WebAssembly module…");
+      const wasmUrl = new URL("filmcraft_web_bg.wasm", location.href);
+      let module;
+      try {
+        module = await WebAssembly.compileStreaming(fetch(wasmUrl));
+      } catch (streamErr) {
+        console.warn("compileStreaming fallback:", streamErr);
+        setStatus("Compiling WebAssembly module…");
+        const resp = await fetch(wasmUrl);
+        const bytes = await resp.arrayBuffer();
+        module = await WebAssembly.compile(bytes);
+      }
+      setStatus("Initializing Rust runtime…");
+      await init({ module_or_path: module });
+      module = null;
+      window.filmcraftLoad.wasmMs = performance.now() - t0;
+
+      setStatus("Starting FilmCraft Pocket UI & Canvas…");
+      await fc.start("filmcraft_canvas");
+      window.filmcraftLoad.readyMs = performance.now() - t0;
+      if (window.AndroidBridge && window.AndroidBridge.onAppReady) {
+        window.AndroidBridge.onAppReady();
+      }
+      const loader = document.getElementById("loading");
+      if (loader) loader.style.display = "none";
+    } catch (e) {
+      console.error("FilmCraft Pocket start error:", e);
+      const errMsg = (e && (e.stack || e.message)) ? String(e.stack || e.message) : String(e);
+      if (window.AndroidBridge && window.AndroidBridge.reportError) {
+        window.AndroidBridge.reportError(String(e), errMsg);
+      }
+      const s = document.getElementById("status");
+      const sub = document.getElementById("substatus");
+      if (s) {
+        s.className = "err";
+        s.textContent = "FilmCraft Pocket could not start:\n" + errMsg;
+      }
+      if (sub) {
+        sub.innerHTML = "<div style='display:flex;gap:10px;margin-top:14px;'>" +
+          "<button onclick='location.reload()' style='padding:10px 20px;background:#7457c8;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;'>Retry</button>" +
+          "<button onclick='location.href=\"index.html?nosw&noworkers&home&empty&webgl\"' style='padding:10px 20px;background:#383942;color:#e3e3e3;border:1px solid #555;border-radius:6px;cursor:pointer;'>Clean Home Start</button>" +
+          "</div>";
+      }
+      window.filmcraftLoad.error = errMsg;
+    }
+  </script>
+  <script src="keyboard.js"></script>
+</body>
+</html>
